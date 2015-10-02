@@ -42,5 +42,8 @@
 (defprotocol Executor
   (exec [e runnable] "execute runnable asynchronously"))
 
+(defprotocol ExecutorContainer
+  (executor [this] "Returns executor instance"))
+
 ;; Defines a buffer that will never block (return true to full?)
 (defprotocol UnblockingBuffer)

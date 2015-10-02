@@ -75,12 +75,22 @@
   if an exception occurs during transformation it will be called with
   the Throwable as an argument, and any non-nil return value will be
   placed in the channel."
-  ([] (chan nil))
+  ([] (channels/chan))
   ([buf-or-n] (chan buf-or-n nil))
   ([buf-or-n xform] (chan buf-or-n xform nil))
   ([buf-or-n xform ex-handler]
      (when xform (assert buf-or-n "buffer must be supplied when transducer is"))
      (channels/chan (if (number? buf-or-n) (buffer buf-or-n) buf-or-n) xform ex-handler)))
+
+(defn chan-factory [executor]
+  (let [buf-builder (fn [buf-or-n] (if (number? buf-or-n) (buffer buf-or-n) buf-or-n))]
+    (fn
+      ([] (channels/chan-constructor :executor executor))
+      ([buf-or-n] (channels/chan-constructor :buf (buf-builder buf-or-n) :executor executor))
+      ([buf-or-n xform] (channels/chan-constructor :buf (buf-builder buf-or-n) :xform xform :executor executor))
+      ([buf-or-n xform ex-handler]
+       (when xform (assert buf-or-n "buffer must be supplied when transducer is"))
+       (channels/chan-constructor :buf (buf-builder buf-or-n) :xform xform :ex-handler ex-handler :executor executor)))))
 
 (defn timeout
   "Returns a channel that will close after msecs"
@@ -110,12 +120,13 @@
    Returns nil."
   ([port fn1] (take! port fn1 true))
   ([port fn1 on-caller?]
-     (let [ret (impl/take! port (fn-handler fn1))]
+     (let [ret (impl/take! port (fn-handler fn1))
+           executor (impl/executor port)]
        (when ret
          (let [val @ret]
            (if on-caller?
              (fn1 val)
-             (dispatch/run #(fn1 val)))))
+             (dispatch/run #(fn1 val) :executor executor))))
        nil)))
 
 (defn >!!
@@ -151,10 +162,11 @@
   ([port val fn1] (put! port val fn1 true))
   ([port val fn1 on-caller?]
      (if-let [retb (impl/put! port val (fn-handler fn1))]
-       (let [ret @retb]
+       (let [ret @retb
+             executor (impl/executor port)]
          (if on-caller?
            (fn1 ret)
-           (dispatch/run #(fn1 ret)))
+           (dispatch/run #(fn1 ret) :executor executor))
          ret)
        true)))
 
@@ -384,6 +396,7 @@
   (let [ret (impl/take! port (fn-handler nop false))]
     (when ret @ret)))
 
+;; todo - add support of explicit executor in all go-like macroses
 (defmacro go
   "Asynchronously executes the body, returning immediately to the
   calling thread. Additionally, any visible calls to <!, >! and alt!/alts!
@@ -404,6 +417,29 @@
                          (ioc/aset-all! ioc/USER-START-IDX c#
                                         ioc/BINDINGS-IDX captured-bindings#))]
           (ioc/run-state-machine-wrapped state#))))
+     c#))
+
+(defmacro go-with
+  "Asynchronously executes the body, returning immediately to the
+  calling thread. Additionally, any visible calls to <!, >! and alt!/alts!
+  channel operations within the body will block (if necessary) by
+  'parking' the calling thread rather than tying up an OS thread (or
+  the only JS thread when in ClojureScript). Upon completion of the
+  operation, the body will be resumed.
+
+  Returns a channel which will receive the result of the body when
+  completed"
+  [executor & body]
+  `(let [c# ((chan-factory ~executor) 1)
+         captured-bindings# (clojure.lang.Var/getThreadBindingFrame)]
+     (dispatch/run
+       (fn []
+         (let [f# ~(ioc/state-machine `(do ~@body) 1 (keys &env) ioc/async-custom-terminators)
+               state# (-> (f#)
+                          (ioc/aset-all! ioc/USER-START-IDX c#
+                                         ioc/BINDINGS-IDX captured-bindings#))]
+           (ioc/run-state-machine-wrapped state#)))
+       :executor ~executor)
      c#))
 
 (defonce ^:private ^Executor thread-macro-executor
@@ -440,6 +476,11 @@
   "Like (go (loop ...))"
   [bindings & body]
   `(go (loop ~bindings ~@body)))
+
+(defmacro go-loop-with
+  "Like (go-with executor (loop ...))"
+  [executor bindings & body]
+  `(go-with ~executor (loop ~bindings ~@body)))
 
 (defn pipe
   "Takes elements from the from channel and supplies them to the to

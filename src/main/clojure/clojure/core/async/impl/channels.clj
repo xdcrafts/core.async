@@ -10,7 +10,8 @@
   clojure.core.async.impl.channels
   (:require [clojure.core.async.impl.protocols :as impl]
             [clojure.core.async.impl.dispatch :as dispatch]
-            [clojure.core.async.impl.mutex :as mutex])
+            [clojure.core.async.impl.mutex :as mutex]
+            [clojure.core.async.impl.exec.threadpool :as tp])
   (:import [java.util LinkedList Queue Iterator]
            [java.util.concurrent.locks Lock]))
 
@@ -29,7 +30,9 @@
   (cleanup [_])
   (abort [_]))
 
-(deftype ManyToManyChannel [^LinkedList takes ^LinkedList puts ^Queue buf closed ^Lock mutex add!]
+(deftype ManyToManyChannel [^LinkedList takes ^LinkedList puts ^Queue buf closed ^Lock mutex executor add!]
+  impl/ExecutorContainer
+  (executor [_] executor)
   MMC
   (cleanup
    [_]
@@ -57,7 +60,7 @@
          (let [put-cb (and (impl/active? putter) (impl/commit putter))]
            (.unlock putter)
            (when put-cb
-             (dispatch/run (fn [] (put-cb true))))
+             (dispatch/run (fn [] (put-cb true)) :executor executor))
            (when (.hasNext iter)
              (recur (.next iter)))))))
    (.clear puts)
@@ -99,7 +102,7 @@
                          (when done?
                            (abort this))
                          (.unlock mutex)
-                         (dispatch/run (fn [] (take-cb val))))
+                         (dispatch/run (fn [] (take-cb val)) :executor executor))
                        (do
                          (when done?
                            (abort this))
@@ -130,7 +133,7 @@
            (if (and put-cb take-cb)
              (do
                (.unlock mutex)
-               (dispatch/run (fn [] (take-cb val)))
+               (dispatch/run (fn [] (take-cb val)) :executor executor)
                (box true))
              (if (and buf (not (impl/full? buf)))
                (do
@@ -155,7 +158,7 @@
                    (.add puts [handler val]))
                  (.unlock mutex)
                  nil))))))))
-  
+
   impl/ReadPort
   (take!
    [this handler]
@@ -189,7 +192,7 @@
                (abort this))
              (.unlock mutex)
              (doseq [cb cbs]
-               (dispatch/run #(cb true)))
+               (dispatch/run #(cb true) :executor executor))
              (box val))
            (do (.unlock mutex)
                nil)))
@@ -215,7 +218,7 @@
          (if (and put-cb take-cb)
            (do
              (.unlock mutex)
-             (dispatch/run #(put-cb true))
+             (dispatch/run #(put-cb true) :executor executor)
              (box val))
            (if @closed
              (do
@@ -260,7 +263,7 @@
                (.unlock taker)
                (when take-cb
                  (let [val (when (and buf (pos? (count buf))) (impl/remove! buf))]
-                   (dispatch/run (fn [] (take-cb val)))))
+                   (dispatch/run (fn [] (take-cb val)) :executor executor)))
                (.remove iter)
                (when (.hasNext iter)
                  (recur (.next iter)))))))
@@ -279,22 +282,32 @@
       buf
       (impl/add! buf else))))
 
-(defn chan
-  ([buf] (chan buf nil))
-  ([buf xform] (chan buf xform nil))
-  ([buf xform exh]
-     (ManyToManyChannel.
-      (LinkedList.) (LinkedList.) buf (atom false) (mutex/mutex)
-      (let [add! (if xform (xform impl/add!) impl/add!)]
-        (fn
-          ([buf]
-             (try
-               (add! buf)
-               (catch Throwable t
-                 (handle buf exh t))))
-          ([buf val]
-             (try
-               (add! buf val)
-               (catch Throwable t
-                 (handle buf exh t)))))))))
+(defn chan-constructor
+  [& {:keys [:buf :xform :exh :executor] :or {:executor (tp/thread-pool-executor)}}]
+  (ManyToManyChannel.
+    (LinkedList.) (LinkedList.) buf (atom false) (mutex/mutex) executor
+    (let [add! (if xform (xform impl/add!) impl/add!)]
+      (fn
+        ([buf]
+         (try
+           (add! buf)
+           (catch Throwable t
+             (handle buf exh t))))
+        ([buf val]
+         (try
+           (add! buf val)
+           (catch Throwable t
+             (handle buf exh t))))))))
 
+(defn chan
+  ([] (chan nil nil nil))
+  ([buf] (chan buf nil nil))
+  ([buf xform] (chan buf xform nil))
+  ([buf xform exh] (chan-constructor :buf buf :xfrom xform :exh exh)))
+
+(defn chan-factory [executor]
+  (fn
+    ([] (chan-constructor :executor executor))
+    ([buf] (chan-constructor :buf buf :executor executor))
+    ([buf xform] (chan-constructor :buf buf :xform xform :executor executor))
+    ([buf xform exh] (chan-constructor :buf buf :xform xform :exh exh :executor executor))))

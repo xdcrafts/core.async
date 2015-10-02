@@ -17,5 +17,5 @@
 
 (defn run
   "Runs Runnable r in a thread pool thread"
-  [^Runnable r]
-  (impl/exec @executor r))
+  [^Runnable r & {:keys [:executor] :or {:executor @executor}}]
+  (impl/exec executor r))
